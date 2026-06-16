@@ -227,15 +227,14 @@ def main():
 
     # Load already-processed URLs from existing index to skip on restart
     processed = set()
-    if open(OUTPUT_FILE, "r", encoding="utf-8").read():
-        try:
-            with open(OUTPUT_FILE, "r", encoding="utf-8") as f:
-                for line in f:
-                    rec = json.loads(line)
-                    processed.add(rec["url"])
-            log.info("loaded %d already-processed URLs, skipping them", len(processed))
-        except Exception:
-            processed = set()
+    try:
+        with open(OUTPUT_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                rec = json.loads(line)
+                processed.add(rec["url"])
+        log.info("loaded %d already-processed URLs, skipping them", len(processed))
+    except FileNotFoundError:
+        pass
 
     remaining = [u for u in urls if u not in processed]
     log.info("%d PDFs remaining to process", len(remaining))
