@@ -225,14 +225,25 @@ def main():
         log.info("no PDFs found, exiting")
         return
 
-    # Clear output file
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as out:
-        pass
+    # Load already-processed URLs from existing index to skip on restart
+    processed = set()
+    if open(OUTPUT_FILE, "r", encoding="utf-8").read():
+        try:
+            with open(OUTPUT_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    rec = json.loads(line)
+                    processed.add(rec["url"])
+            log.info("loaded %d already-processed URLs, skipping them", len(processed))
+        except Exception:
+            processed = set()
+
+    remaining = [u for u in urls if u not in processed]
+    log.info("%d PDFs remaining to process", len(remaining))
 
     written = 0
-    with tqdm(total=total, desc="Extracting PDFs", unit="pdf", ncols=80) as pbar:
+    with tqdm(total=len(remaining), desc="Extracting PDFs", unit="pdf", ncols=80) as pbar:
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-            futures = {pool.submit(process_one_pdf, url, pbar): url for url in urls}
+            futures = {pool.submit(process_one_pdf, url, pbar): url for url in remaining}
             for future in as_completed(futures):
                 try:
                     written += future.result()
