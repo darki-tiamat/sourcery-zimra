@@ -1,0 +1,41 @@
+name: crawl
+
+on:
+  push:
+    branches: [main, master]
+  schedule:
+    - cron: "0 3 1 * *"  # 03:00 UTC on the 1st of each month
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r crawler/requirements.txt
+
+      - name: Run crawler
+        run: python crawler/crawl.py
+
+      - name: Commit index
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add index.ndjson
+          if git diff --staged --quiet; then
+            echo "No index changes."
+          else
+            git commit -m "chore: update index.ndjson"
+            git push
+          fi
