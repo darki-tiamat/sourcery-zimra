@@ -23,10 +23,10 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install -r crawler/requirements.txt
+        run: pip install -r requirements.txt
 
       - name: Run crawler
-        run: python crawler/crawl.py
+        run: python crawl.py
 
       - name: Commit index
         run: |
