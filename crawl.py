@@ -12,71 +12,57 @@ NDJSON line shape:
 
 import io
 import json
+import logging
 import re
 import sys
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin, urlparse, unquote, parse_qs
 
 import requests
 from bs4 import BeautifulSoup
 import pdfplumber
+from tqdm import tqdm
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stderr,
+)
+log = logging.getLogger("zimra-crawler")
 
 BASE_URL = "https://www.zimra.co.zw"
 
-# Comprehensive seed pages covering all ZIMRA download categories.
-# The crawler follows pagination (?start=N) on each page automatically.
 SEED_PAGES = [
-    # Legislation / Acts
     "https://www.zimra.co.zw/downloads/category/17-acts",
-    # Annual Reports
     "https://www.zimra.co.zw/downloads/category/2-annual-reports",
-    # Domestic Taxes (PAYE, VAT, corporate, forms, etc.)
     "https://www.zimra.co.zw/downloads/category/9-domestic-taxes",
-    # Public Notices
     "https://www.zimra.co.zw/public-notices",
-    # Revenue Performance Reports
     "https://www.zimra.co.zw/downloads/category/12-revenue-perfomance-reports",
-    # Exchange Rates (current)
     "https://www.zimra.co.zw/downloads/category/10-exchange-rates",
-    # Exchange Rates 2021
     "https://www.zimra.co.zw/downloads/category/41-exchange-rates-2021",
-    # Exchange Rates 2022
     "https://www.zimra.co.zw/downloads/category/75-exchange-rates-2022",
-    # Exchange Rates 2023+
     "https://www.zimra.co.zw/downloads/category/77-exchange-rates-2023",
-    # Consumer Price Index
     "https://www.zimra.co.zw/downloads/category/37-consumer-price-index",
-    # Customs rulings
     "https://www.zimra.co.zw/customs/rulings",
-    # Customs documents
     "https://www.zimra.co.zw/customs/customs-documents",
-    # Rummage Auction Sales
     "https://www.zimra.co.zw/rummage-auction-sales",
-    # Client Satisfaction Surveys
     "https://www.zimra.co.zw/client-satisfaction-surveys",
-    # Vacancies
     "https://www.zimra.co.zw/vacancies",
-    # AEO (Authorised Economic Operator)
     "https://www.zimra.co.zw/authorised-economic-operator-aeo",
-    # Strategic Plans
     "https://www.zimra.co.zw/about-us/strategic-plan",
     "https://www.zimra.co.zw/downloads/category/57-strategic-plans",
-    # TaRMS FAQs
     "https://www.zimra.co.zw/frequently-asked-questions/tarms-faqs",
-    # Anti-Money Laundering
     "https://www.zimra.co.zw/revenue-assurance-and-special-project/anti-money-laundering",
-    # Audited Financial Results
     "https://www.zimra.co.zw/about-us/audited-financial-results",
-    # Transfer Pricing Documentation
     "https://www.zimra.co.zw/downloads/category/44-transfer-pricing-documentation",
-    # Publications
     "https://www.zimra.co.zw/public-notices/publications",
-    # Domestic Taxes sub-pages with PDFs
     "https://www.zimra.co.zw/domestic-taxes/individual/pay-as-you-earn-paye",
     "https://www.zimra.co.zw/domestic-taxes/corporate/tax-rates",
     "https://www.zimra.co.zw/domestic-taxes/tax-tables",
     "https://www.zimra.co.zw/domestic-taxes/vat/mechanics-of-vat",
-    # Customs sub-pages with PDFs
     "https://www.zimra.co.zw/customs/customs-and-excise-duties",
     "https://www.zimra.co.zw/customs/customs-clearance-procedures",
     "https://www.zimra.co.zw/customs/commercial-guidelines-on-imports-exports",
@@ -84,9 +70,7 @@ SEED_PAGES = [
     "https://www.zimra.co.zw/customs/classification-of-goods/customs-and-excise-duties-2022",
     "https://www.zimra.co.zw/customs/what-is-excise-duty-and-surtax",
     "https://www.zimra.co.zw/customs/carbon-tax-rates-road-access-fees",
-    # Legislation main page
     "https://www.zimra.co.zw/legislation",
-    # Exchange of Information
     "https://www.zimra.co.zw/exchange-of-information-eoi",
 ]
 
@@ -95,22 +79,25 @@ USER_AGENT = "SourceryCrawler/1.0 (+https://github.com/darkian-corpuses)"
 REQUEST_TIMEOUT = 60
 MIN_CHUNK_CHARS = 40
 PARAGRAPH_SPLIT = re.compile(r"\n\s*\n")
+MAX_WORKERS = 16
+PAGE_DELAY = 0.3  # delay between seed page fetches
 
 session = requests.Session()
 session.headers.update({"User-Agent": USER_AGENT})
 
-def discover_pdf_urls():
-    """Return a de-duplicated, ordered list of absolute PDF URLs.
+# Thread-safe output
+_write_lock = threading.Lock()
+_written_count = 0
+_count_lock = threading.Lock()
 
-    For each seed page, scrape PDF anchor links and follow pagination
-    links (?start=N) to discover all documents across multi-page listings.
-    """
+
+def discover_pdf_urls():
+    """Return a de-duplicated, ordered list of absolute PDF URLs."""
     found = []
     seen = set()
     visited_pages = set()
 
     def _scrape_page(url):
-        """Scrape a single page for PDF links, return list of pagination URLs."""
         if url in visited_pages:
             return []
         visited_pages.add(url)
@@ -119,24 +106,21 @@ def discover_pdf_urls():
             resp = session.get(url, timeout=REQUEST_TIMEOUT)
             resp.raise_for_status()
         except requests.RequestException as exc:
-            print(f"[warn] page failed {url}: {exc}", file=sys.stderr)
+            log.warning("page failed %s: %s", url, exc)
             return []
-        soup = BeautifulSoup(resp.text, "html.parser")
+        soup = BeautifulSoup(resp.text, "lxml")
         for anchor in soup.find_all("a", href=True):
             href = anchor["href"]
             absolute = urljoin(url, href)
             parsed = urlparse(absolute)
             path = parsed.path.lower()
             qs = parse_qs(parsed.query)
-            # Collect PDF links (direct .pdf files)
             if path.endswith(".pdf") and absolute not in seen:
                 seen.add(absolute)
                 found.append(absolute)
-            # Collect download links (/downloads?download=ID:slug) as PDFs to fetch
             elif "download" in qs and absolute not in seen:
                 seen.add(absolute)
                 found.append(absolute)
-            # Detect pagination links (?start=N) on the same domain
             if "start" in qs and parsed.netloc == urlparse(BASE_URL).netloc:
                 if absolute not in visited_pages:
                     pagination_urls.append(absolute)
@@ -148,13 +132,14 @@ def discover_pdf_urls():
             current = queue.pop(0)
             next_pages = _scrape_page(current)
             queue.extend(next_pages)
+        time.sleep(PAGE_DELAY)
 
     return found
+
 
 def title_from_url(url):
     """Derive a human-readable title from a URL."""
     parsed = urlparse(url)
-    # Handle /downloads?download=ID:slug format
     qs = parse_qs(parsed.query)
     if "download" in qs:
         slug = qs["download"][0].split(":", 1)[-1] if ":" in qs["download"][0] else qs["download"][0]
@@ -165,12 +150,13 @@ def title_from_url(url):
         name = name[:-4]
     return name.replace("_", " ").replace("-", " ").strip() or url
 
+
 def fetch_pdf_bytes(url):
     """Download PDF bytes, following redirects to the actual file."""
     resp = session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
     resp.raise_for_status()
-    # ZIMRA download links may redirect; update title source if needed
     return resp.content, resp.url
+
 
 def chunks_from_pdf(data):
     """Yield (page_number, chunk_text) for paragraph chunks in the PDF."""
@@ -182,36 +168,85 @@ def chunks_from_pdf(data):
                 if len(chunk) >= MIN_CHUNK_CHARS:
                     yield page_index, chunk
 
+
+def process_one_pdf(url, pbar):
+    """Download and extract a single PDF. Returns number of chunks written."""
+    global _written_count
+    title = title_from_url(url)
+    pdf_start = time.monotonic()
+    try:
+        data, final_url = fetch_pdf_bytes(url)
+    except requests.RequestException as exc:
+        log.warning("download failed [%s]: %s", title, exc)
+        pbar.update(1)
+        return 0
+
+    try:
+        title = title_from_url(final_url)
+        chunks = list(chunks_from_pdf(data))
+        elapsed = time.monotonic() - pdf_start
+        log.info("extracted [%s] %d chunks in %.1fs", title, len(chunks), elapsed)
+    except Exception as exc:
+        elapsed = time.monotonic() - pdf_start
+        log.warning("extract failed [%s] after %.1fs: %s", title, elapsed, exc)
+        pbar.update(1)
+        return 0
+    finally:
+        del data
+
+    records = []
+    for page_number, chunk in chunks:
+        records.append(json.dumps({
+            "url": url,
+            "title": title,
+            "page": page_number,
+            "chunk": chunk,
+        }, ensure_ascii=False))
+
+    with _write_lock:
+        with open(OUTPUT_FILE, "a", encoding="utf-8") as out:
+            out.write("\n".join(records) + "\n")
+        _written_count += len(records)
+
+    pbar.update(1)
+    return len(records)
+
+
 def main():
+    global _written_count
+
+    t0 = time.monotonic()
     urls = discover_pdf_urls()
-    print(f"[info] discovered {len(urls)} PDF URLs", file=sys.stderr)
+    discovery_time = time.monotonic() - t0
+    total = len(urls)
+    log.info("discovered %d PDF URLs in %.1fs", total, discovery_time)
+
+    if total == 0:
+        log.info("no PDFs found, exiting")
+        return
+
+    # Clear output file
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as out:
+        pass
 
     written = 0
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as out:
-        for url in urls:
-            try:
-                data, final_url = fetch_pdf_bytes(url)
-            except requests.RequestException as exc:
-                print(f"[warn] download failed {url}: {exc}", file=sys.stderr)
-                continue
-            title = title_from_url(final_url)
-            try:
-                for page_number, chunk in chunks_from_pdf(data):
-                    record = {
-                        "url": url,
-                        "title": title,
-                        "page": page_number,
-                        "chunk": chunk,
-                    }
-                    out.write(json.dumps(record, ensure_ascii=False) + "\n")
-                    written += 1
-            except Exception as exc:  # pdfplumber can raise on malformed PDFs
-                print(f"[warn] extract failed {url}: {exc}", file=sys.stderr)
-            finally:
-                del data  # discard bytes; never persisted
-            time.sleep(1)
+    with tqdm(total=total, desc="Extracting PDFs", unit="pdf", ncols=80) as pbar:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            futures = {pool.submit(process_one_pdf, url, pbar): url for url in urls}
+            for future in as_completed(futures):
+                try:
+                    written += future.result()
+                except Exception as exc:
+                    url = futures[future]
+                    log.error("unexpected error [%s]: %s", url, exc)
 
-    print(f"[info] wrote {written} chunks to {OUTPUT_FILE}", file=sys.stderr)
+    elapsed = time.monotonic() - t0
+    rate = _written_count / elapsed if elapsed > 0 else 0
+    log.info(
+        "done: %d chunks from %d PDFs in %.1fs (%.1f chunks/s)",
+        _written_count, total, elapsed, rate,
+    )
+
 
 if __name__ == "__main__":
     main()
