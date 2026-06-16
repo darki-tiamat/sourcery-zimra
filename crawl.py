@@ -81,6 +81,7 @@ REQUEST_TIMEOUT = 60
 MIN_CHUNK_CHARS = 40
 PARAGRAPH_SPLIT = re.compile(r"\n\s*\n")
 MAX_WORKERS = 10
+PER_PDF_TIMEOUT = 300  # 5 minutes per PDF extraction
 PAGE_DELAY = 0.3  # delay between seed page fetches
 
 session = requests.Session()
@@ -138,6 +139,21 @@ def discover_pdf_urls():
     return found
 
 
+def priority_score(url):
+    """Sort by importance — legal docs first, exchange rates last."""
+    u = url.lower()
+    if any(x in u for x in ["act", "legislation", "finance-bill", "tariff", "customs-and-excise"]):
+        return 0
+    if any(x in u for x in ["annual-report", "strategic-plan", "transfer-pricing", "audited"]):
+        return 1
+    if any(x in u for x in ["domestic-tax", "vat", "paye", "ruling"]):
+        return 2
+    if any(x in u for x in ["public-notice", "vacancy", "rummage", "survey"]):
+        return 3
+    if "exchange-rate" in u or "category/10" in u or "consumer-price" in u:
+        return 4
+    return 2
+
 def title_from_url(url):
     """Derive a human-readable title from a URL."""
     parsed = urlparse(url)
@@ -160,9 +176,13 @@ def fetch_pdf_bytes(url):
 
 
 def chunks_from_pdf(data):
-    """Yield (page_number, chunk_text) for paragraph chunks in the PDF."""
+    """Yield (page_number, chunk_text); aborts if extraction exceeds timeout."""
+    deadline = time.monotonic() + PER_PDF_TIMEOUT
     with pdfplumber.open(io.BytesIO(data)) as pdf:
         for page_index, page in enumerate(pdf.pages, start=1):
+            if time.monotonic() > deadline:
+                log.warning("timeout hit on page %d, partial extract kept", page_index)
+                return
             text = page.extract_text() or ""
             for raw in PARAGRAPH_SPLIT.split(text):
                 chunk = " ".join(raw.split())
@@ -197,6 +217,7 @@ def process_one_pdf(url, pbar, known_hashes):
 
     content_hash = hashlib.sha256(data).hexdigest()
     content_size = str(len(data))
+    pdf_size_mb = len(data) / (1024 * 1024)
 
     # Double-check hash if we had to download (size changed but hash might match)
     if url in known_hashes and known_hashes[url].get("hash") == content_hash:
@@ -243,6 +264,7 @@ def main():
 
     t0 = time.monotonic()
     urls = discover_pdf_urls()
+    urls.sort(key=priority_score)
     discovery_time = time.monotonic() - t0
     total = len(urls)
     log.info("discovered %d PDF URLs in %.1fs", total, discovery_time)
