@@ -10,6 +10,7 @@ NDJSON line shape:
   {"url": "...", "title": "...", "page": 1, "chunk": "..."}
 """
 
+import hashlib
 import io
 import json
 import logging
@@ -79,7 +80,7 @@ USER_AGENT = "SourceryCrawler/1.0 (+https://github.com/darkian-corpuses)"
 REQUEST_TIMEOUT = 60
 MIN_CHUNK_CHARS = 40
 PARAGRAPH_SPLIT = re.compile(r"\n\s*\n")
-MAX_WORKERS = 16
+MAX_WORKERS = 10
 PAGE_DELAY = 0.3  # delay between seed page fetches
 
 session = requests.Session()
@@ -169,16 +170,39 @@ def chunks_from_pdf(data):
                     yield page_index, chunk
 
 
-def process_one_pdf(url, pbar):
+def process_one_pdf(url, pbar, known_hashes):
     """Download and extract a single PDF. Returns number of chunks written."""
     global _written_count
     title = title_from_url(url)
     pdf_start = time.monotonic()
+
+    # Quick skip: if URL is known and content-length matches, skip entirely
+    if url in known_hashes:
+        try:
+            head = session.head(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+            content_length = head.headers.get("Content-Length", "")
+            if content_length and known_hashes[url].get("size") == content_length:
+                log.info("skipped [%s] (unchanged, %s bytes)", title, content_length)
+                pbar.update(1)
+                return 0
+        except requests.RequestException:
+            pass  # fall through to full download
+
     try:
         data, final_url = fetch_pdf_bytes(url)
     except requests.RequestException as exc:
         log.warning("download failed [%s]: %s", title, exc)
         pbar.update(1)
+        return 0
+
+    content_hash = hashlib.sha256(data).hexdigest()
+    content_size = str(len(data))
+
+    # Double-check hash if we had to download (size changed but hash might match)
+    if url in known_hashes and known_hashes[url].get("hash") == content_hash:
+        log.info("skipped [%s] (unchanged, hash match)", title)
+        pbar.update(1)
+        del data
         return 0
 
     try:
@@ -201,6 +225,8 @@ def process_one_pdf(url, pbar):
             "title": title,
             "page": page_number,
             "chunk": chunk,
+            "hash": content_hash,
+            "size": content_size,
         }, ensure_ascii=False))
 
     with _write_lock:
@@ -225,24 +251,32 @@ def main():
         log.info("no PDFs found, exiting")
         return
 
-    # Load already-processed URLs from existing index to skip on restart
-    processed = set()
+    # Load known hashes from existing index to detect updates
+    known_hashes = {}
     try:
         with open(OUTPUT_FILE, "r", encoding="utf-8") as f:
             for line in f:
                 rec = json.loads(line)
-                processed.add(rec["url"])
-        log.info("loaded %d already-processed URLs, skipping them", len(processed))
+                if "hash" in rec:
+                    known_hashes[rec["url"]] = {
+                        "hash": rec["hash"],
+                        "size": rec.get("size", ""),
+                    }
+        log.info("loaded %d known hashes", len(known_hashes))
     except FileNotFoundError:
         pass
 
-    remaining = [u for u in urls if u not in processed]
-    log.info("%d PDFs remaining to process", len(remaining))
+    # Overwrite index — re-extract everything, hashes written fresh
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as out:
+        pass
 
     written = 0
-    with tqdm(total=len(remaining), desc="Extracting PDFs", unit="pdf", ncols=80) as pbar:
+    with tqdm(total=total, desc="Extracting PDFs", unit="pdf", ncols=80) as pbar:
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-            futures = {pool.submit(process_one_pdf, url, pbar): url for url in remaining}
+            futures = {
+                pool.submit(process_one_pdf, url, pbar, known_hashes): url
+                for url in urls
+            }
             for future in as_completed(futures):
                 try:
                     written += future.result()
